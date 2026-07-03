@@ -1,0 +1,2080 @@
+-- Extension UUID
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+
+-- ── 1. PROFILES ──────────────────────────────────────────────
+CREATE TABLE public.profiles (
+  id            uuid PRIMARY KEY REFERENCES auth.users(id) ON DELETE CASCADE,
+  email         text NOT NULL,
+  full_name     text,
+  avatar_url    text,
+  role          text NOT NULL DEFAULT 'user'
+                  CHECK (role IN ('user','nutritionist','partner_admin','admin')),
+  created_at    timestamptz NOT NULL DEFAULT now(),
+  updated_at    timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE OR REPLACE FUNCTION public.handle_new_user()
+RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER AS $$
+BEGIN
+  INSERT INTO public.profiles (id, email, full_name, avatar_url)
+  VALUES (
+    NEW.id,
+    NEW.email,
+    NEW.raw_user_meta_data->>'full_name',
+    NEW.raw_user_meta_data->>'avatar_url'
+  );
+  RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER on_auth_user_created
+  AFTER INSERT ON auth.users
+  FOR EACH ROW EXECUTE PROCEDURE public.handle_new_user();
+
+-- ── 2. USER HEALTH PROFILES ───────────────────────────────────
+CREATE TABLE public.user_health_profiles (
+  id                uuid PRIMARY KEY DEFAULT uuid_generate_v4(),
+  user_id           uuid NOT NULL REFERENCES public.profiles(id) ON DELETE CASCADE,
+  age               smallint CHECK (age > 0 AND age < 130),
+  weight_kg         numeric(5,2) CHECK (weight_kg > 0),
+  height_cm         numeric(5,2) CHECK (height_cm > 0),
+  activity_level    text CHECK (activity_level IN ('sedentary','moderate','active')),
+  health_conditions text[] DEFAULT '{}',
+  goals             text[] DEFAULT '{}',
+  bmr_kcal          numeric(7,2),
+  tdee_kcal         numeric(7,2),
+  is_complete       boolean NOT NULL DEFAULT false,
+  created_at        timestamptz NOT NULL DEFAULT now(),
+  updated_at        timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (user_id)
+);
+
+-- ── 3. PARTNERS ───────────────────────────────────────────────
+CREATE TABLE public.partners (
+  id            uuid PRIMARY KEY DEFAULT uuid_generate_v4(),
+  owner_id      uuid REFERENCES public.profiles(id) ON DELETE SET NULL,
+  name          text NOT NULL,
+  description   text,
+  logo_url      text,
+  cover_url     text,
+  address_line  text,
+  city          text,
+  postal_code   text,
+  country       text NOT NULL DEFAULT 'DZ',
+  latitude      numeric(9,6),
+  longitude     numeric(9,6),
+  phone         text,
+  email         text,
+  website       text,
+  opening_hours jsonb,
+  partner_code  text UNIQUE,
+  is_active     boolean NOT NULL DEFAULT true,
+  is_verified   boolean NOT NULL DEFAULT false,
+  created_at    timestamptz NOT NULL DEFAULT now(),
+  updated_at    timestamptz NOT NULL DEFAULT now()
+);
+
+-- ── 4. PRODUCT CATEGORIES ─────────────────────────────────────
+CREATE TABLE public.product_categories (
+  id          uuid PRIMARY KEY DEFAULT uuid_generate_v4(),
+  name        text NOT NULL UNIQUE,
+  slug        text NOT NULL UNIQUE,
+  icon        text,
+  parent_id   uuid REFERENCES public.product_categories(id) ON DELETE SET NULL,
+  sort_order  smallint NOT NULL DEFAULT 0
+);
+
+INSERT INTO public.product_categories (name, slug, icon) VALUES
+  ('Épicerie salée',    'epicerie-salee',    'rice_bowl'),
+  ('Produits laitiers', 'produits-laitiers', 'egg'),
+  ('Boissons',          'boissons',          'local_drink'),
+  ('Boulangerie',       'boulangerie',       'bakery_dining'),
+  ('Fruits & Légumes',  'fruits-legumes',    'nutrition'),
+  ('Épicerie sucrée',   'epicerie-sucree',   'cake');
+
+-- ── 5. PRODUCTS ───────────────────────────────────────────────
+CREATE TABLE public.products (
+  id               uuid PRIMARY KEY DEFAULT uuid_generate_v4(),
+  category_id      uuid REFERENCES public.product_categories(id) ON DELETE SET NULL,
+  name             text NOT NULL,
+  brand            text,
+  description      text,
+  barcode          text UNIQUE,
+  image_url        text,
+  image_urls       text[] DEFAULT '{}',
+  nutri_score      char(1) CHECK (nutri_score IN ('A','B','C','D','E')),
+  glycemic_index   smallint CHECK (glycemic_index >= 0 AND glycemic_index <= 100),
+  labels           text[] DEFAULT '{}',
+  compatible_with  text[] DEFAULT '{}',
+  energy_kcal      numeric(7,2),
+  carbs_g          numeric(6,2),
+  sugars_g         numeric(6,2),
+  fat_g            numeric(6,2),
+  saturated_fat_g  numeric(6,2),
+  fiber_g          numeric(6,2),
+  protein_g        numeric(6,2),
+  sodium_g         numeric(6,2),
+  is_published     boolean NOT NULL DEFAULT true,
+  created_at       timestamptz NOT NULL DEFAULT now(),
+  updated_at       timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE INDEX idx_products_gi     ON public.products(glycemic_index);
+CREATE INDEX idx_products_score  ON public.products(nutri_score);
+CREATE INDEX idx_products_labels ON public.products USING gin(labels);
+CREATE INDEX idx_products_compat ON public.products USING gin(compatible_with);
+
+-- ── 6. PARTNER INVENTORY ─────────────────────────────────────
+CREATE TABLE public.partner_inventory (
+  id                   uuid PRIMARY KEY DEFAULT uuid_generate_v4(),
+  partner_id           uuid NOT NULL REFERENCES public.partners(id) ON DELETE CASCADE,
+  product_id           uuid NOT NULL REFERENCES public.products(id) ON DELETE CASCADE,
+  price                numeric(10,2) NOT NULL CHECK (price >= 0),
+  currency             char(3) NOT NULL DEFAULT 'DZD',
+  quantity             integer NOT NULL DEFAULT 0 CHECK (quantity >= 0),
+  is_available         boolean NOT NULL DEFAULT true,
+  low_stock_threshold  integer NOT NULL DEFAULT 5,
+  updated_at           timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (partner_id, product_id)
+);
+
+CREATE INDEX idx_inventory_partner ON public.partner_inventory(partner_id);
+CREATE INDEX idx_inventory_product ON public.partner_inventory(product_id);
+CREATE INDEX idx_inventory_avail   ON public.partner_inventory(is_available);
+
+-- ── 7. RECIPES ────────────────────────────────────────────────
+CREATE TABLE public.recipes (
+  id              uuid PRIMARY KEY DEFAULT uuid_generate_v4(),
+  created_by      uuid REFERENCES public.profiles(id) ON DELETE SET NULL,
+  title           text NOT NULL,
+  description     text,
+  image_url       text,
+  prep_time_min   smallint CHECK (prep_time_min >= 0),
+  cook_time_min   smallint CHECK (cook_time_min >= 0),
+  servings        smallint CHECK (servings > 0) DEFAULT 2,
+  difficulty      text CHECK (difficulty IN ('easy','medium','hard')) DEFAULT 'medium',
+  calories_kcal   numeric(7,2),
+  price_estimate  numeric(6,2),
+  diet_tags       text[] DEFAULT '{}',
+  compatible_with text[] DEFAULT '{}',
+  is_published    boolean NOT NULL DEFAULT true,
+  is_featured     boolean NOT NULL DEFAULT false,
+  created_at      timestamptz NOT NULL DEFAULT now(),
+  updated_at      timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE INDEX idx_recipes_tags   ON public.recipes USING gin(diet_tags);
+CREATE INDEX idx_recipes_compat ON public.recipes USING gin(compatible_with);
+
+-- ── 8. RECIPE INGREDIENTS ────────────────────────────────────
+CREATE TABLE public.recipe_ingredients (
+  id          uuid PRIMARY KEY DEFAULT uuid_generate_v4(),
+  recipe_id   uuid NOT NULL REFERENCES public.recipes(id) ON DELETE CASCADE,
+  product_id  uuid REFERENCES public.products(id) ON DELETE SET NULL,
+  name        text NOT NULL,
+  quantity    text NOT NULL,
+  sort_order  smallint NOT NULL DEFAULT 0
+);
+
+CREATE INDEX idx_recipe_ingredients_recipe ON public.recipe_ingredients(recipe_id);
+
+-- ── 9. RECIPE STEPS ──────────────────────────────────────────
+CREATE TABLE public.recipe_steps (
+  id          uuid PRIMARY KEY DEFAULT uuid_generate_v4(),
+  recipe_id   uuid NOT NULL REFERENCES public.recipes(id) ON DELETE CASCADE,
+  step_number smallint NOT NULL,
+  instruction text NOT NULL,
+  UNIQUE (recipe_id, step_number)
+);
+
+-- ── 10. ARTICLES ─────────────────────────────────────────────
+CREATE TABLE public.articles (
+  id            uuid PRIMARY KEY DEFAULT uuid_generate_v4(),
+  author_id     uuid REFERENCES public.profiles(id) ON DELETE SET NULL,
+  title         text NOT NULL,
+  slug          text NOT NULL UNIQUE,
+  excerpt       text,
+  content       text,
+  image_url     text,
+  category      text NOT NULL DEFAULT 'general',
+  read_time_min smallint CHECK (read_time_min > 0),
+  difficulty    text CHECK (difficulty IN ('beginner','intermediate','advanced')) DEFAULT 'beginner',
+  tags          text[] DEFAULT '{}',
+  is_published  boolean NOT NULL DEFAULT true,
+  published_at  timestamptz,
+  created_at    timestamptz NOT NULL DEFAULT now(),
+  updated_at    timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE INDEX idx_articles_category ON public.articles(category);
+CREATE INDEX idx_articles_tags     ON public.articles USING gin(tags);
+
+-- ── 11. QUIZZES ───────────────────────────────────────────────
+CREATE TABLE public.quizzes (
+  id          uuid PRIMARY KEY DEFAULT uuid_generate_v4(),
+  article_id  uuid REFERENCES public.articles(id) ON DELETE CASCADE,
+  title       text NOT NULL,
+  created_at  timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE public.quiz_questions (
+  id          uuid PRIMARY KEY DEFAULT uuid_generate_v4(),
+  quiz_id     uuid NOT NULL REFERENCES public.quizzes(id) ON DELETE CASCADE,
+  question    text NOT NULL,
+  sort_order  smallint NOT NULL DEFAULT 0
+);
+
+CREATE TABLE public.quiz_answers (
+  id           uuid PRIMARY KEY DEFAULT uuid_generate_v4(),
+  question_id  uuid NOT NULL REFERENCES public.quiz_questions(id) ON DELETE CASCADE,
+  answer_text  text NOT NULL,
+  is_correct   boolean NOT NULL DEFAULT false,
+  explanation  text,
+  sort_order   smallint NOT NULL DEFAULT 0
+);
+
+CREATE TABLE public.user_quiz_results (
+  id            uuid PRIMARY KEY DEFAULT uuid_generate_v4(),
+  user_id       uuid NOT NULL REFERENCES public.profiles(id) ON DELETE CASCADE,
+  quiz_id       uuid NOT NULL REFERENCES public.quizzes(id) ON DELETE CASCADE,
+  score         smallint NOT NULL,
+  max_score     smallint NOT NULL,
+  completed_at  timestamptz NOT NULL DEFAULT now()
+);
+
+-- ── 12. FAVORIS ───────────────────────────────────────────────
+CREATE TABLE public.user_saved_products (
+  user_id     uuid NOT NULL REFERENCES public.profiles(id) ON DELETE CASCADE,
+  product_id  uuid NOT NULL REFERENCES public.products(id) ON DELETE CASCADE,
+  saved_at    timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (user_id, product_id)
+);
+
+CREATE TABLE public.user_saved_recipes (
+  user_id    uuid NOT NULL REFERENCES public.profiles(id) ON DELETE CASCADE,
+  recipe_id  uuid NOT NULL REFERENCES public.recipes(id) ON DELETE CASCADE,
+  saved_at   timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (user_id, recipe_id)
+);
+
+CREATE TABLE public.user_read_articles (
+  user_id     uuid NOT NULL REFERENCES public.profiles(id) ON DELETE CASCADE,
+  article_id  uuid NOT NULL REFERENCES public.articles(id) ON DELETE CASCADE,
+  read_at     timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (user_id, article_id)
+);
+
+-- ── 13. SHOPPING LISTS ────────────────────────────────────────
+CREATE TABLE public.shopping_lists (
+  id          uuid PRIMARY KEY DEFAULT uuid_generate_v4(),
+  user_id     uuid NOT NULL REFERENCES public.profiles(id) ON DELETE CASCADE,
+  name        text NOT NULL DEFAULT 'Ma liste',
+  is_active   boolean NOT NULL DEFAULT true,
+  created_at  timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE public.shopping_list_items (
+  id               uuid PRIMARY KEY DEFAULT uuid_generate_v4(),
+  shopping_list_id uuid NOT NULL REFERENCES public.shopping_lists(id) ON DELETE CASCADE,
+  product_id       uuid REFERENCES public.products(id) ON DELETE SET NULL,
+  product_name     text NOT NULL,
+  quantity         smallint NOT NULL DEFAULT 1,
+  is_checked       boolean NOT NULL DEFAULT false,
+  added_at         timestamptz NOT NULL DEFAULT now()
+);
+
+-- ── 14. PATIENT ALERTS ────────────────────────────────────────
+CREATE TABLE public.patient_alerts (
+  id              uuid PRIMARY KEY DEFAULT uuid_generate_v4(),
+  nutritionist_id uuid NOT NULL REFERENCES public.profiles(id) ON DELETE CASCADE,
+  patient_id      uuid NOT NULL REFERENCES public.profiles(id) ON DELETE CASCADE,
+  type            text NOT NULL CHECK (type IN ('warning','success','info')),
+  title           text NOT NULL,
+  message         text NOT NULL,
+  is_read         boolean NOT NULL DEFAULT false,
+  created_at      timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE INDEX idx_alerts_nutritionist ON public.patient_alerts(nutritionist_id, is_read);
+
+-- ── 15. ANALYTICS ─────────────────────────────────────────────
+CREATE TABLE public.partner_product_views (
+  id          uuid PRIMARY KEY DEFAULT uuid_generate_v4(),
+  partner_id  uuid NOT NULL REFERENCES public.partners(id) ON DELETE CASCADE,
+  product_id  uuid NOT NULL REFERENCES public.products(id) ON DELETE CASCADE,
+  user_id     uuid REFERENCES public.profiles(id) ON DELETE SET NULL,
+  viewed_at   timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE INDEX idx_views_partner ON public.partner_product_views(partner_id, viewed_at DESC);
+
+CREATE OR REPLACE VIEW public.partner_daily_views AS
+  SELECT
+    partner_id,
+    date_trunc('day', viewed_at) AS day,
+    count(*) AS total_views
+  FROM public.partner_product_views
+  WHERE viewed_at >= now() - INTERVAL '30 days'
+  GROUP BY partner_id, day
+  ORDER BY day;
+
+CREATE TABLE public.product_search_logs (
+  id          uuid PRIMARY KEY DEFAULT uuid_generate_v4(),
+  partner_id  uuid REFERENCES public.partners(id) ON DELETE CASCADE,
+  product_id  uuid REFERENCES public.products(id) ON DELETE CASCADE,
+  search_term text,
+  user_id     uuid REFERENCES public.profiles(id) ON DELETE SET NULL,
+  searched_at timestamptz NOT NULL DEFAULT now()
+);
+
+-- ── 16. UPDATED_AT TRIGGER ────────────────────────────────────
+CREATE OR REPLACE FUNCTION public.set_updated_at()
+RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+  NEW.updated_at = now();
+  RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER set_updated_at BEFORE UPDATE ON public.profiles
+  FOR EACH ROW EXECUTE PROCEDURE public.set_updated_at();
+CREATE TRIGGER set_updated_at BEFORE UPDATE ON public.user_health_profiles
+  FOR EACH ROW EXECUTE PROCEDURE public.set_updated_at();
+CREATE TRIGGER set_updated_at BEFORE UPDATE ON public.partners
+  FOR EACH ROW EXECUTE PROCEDURE public.set_updated_at();
+CREATE TRIGGER set_updated_at BEFORE UPDATE ON public.products
+  FOR EACH ROW EXECUTE PROCEDURE public.set_updated_at();
+CREATE TRIGGER set_updated_at BEFORE UPDATE ON public.partner_inventory
+  FOR EACH ROW EXECUTE PROCEDURE public.set_updated_at();
+CREATE TRIGGER set_updated_at BEFORE UPDATE ON public.recipes
+  FOR EACH ROW EXECUTE PROCEDURE public.set_updated_at();
+CREATE TRIGGER set_updated_at BEFORE UPDATE ON public.articles
+  FOR EACH ROW EXECUTE PROCEDURE public.set_updated_at();
+
+-- ── 17. RLS ───────────────────────────────────────────────────
+ALTER TABLE public.profiles             ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.user_health_profiles ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.partners             ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.partner_inventory    ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.products             ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.product_categories   ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.recipes              ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.recipe_ingredients   ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.recipe_steps         ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.articles             ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.user_saved_products  ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.user_saved_recipes   ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.user_read_articles   ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.shopping_lists       ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.shopping_list_items  ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.patient_alerts       ENABLE ROW LEVEL SECURITY;
+
+CREATE POLICY "Lecture publique des profils"
+  ON public.profiles FOR SELECT USING (true);
+CREATE POLICY "Modification de son propre profil"
+  ON public.profiles FOR UPDATE USING (auth.uid() = id);
+
+CREATE POLICY "Accès à son propre profil santé"
+  ON public.user_health_profiles FOR ALL USING (auth.uid() = user_id);
+
+CREATE POLICY "Lecture publique des produits"
+  ON public.products FOR SELECT USING (is_published = true);
+CREATE POLICY "Lecture publique des catégories"
+  ON public.product_categories FOR SELECT USING (true);
+
+CREATE POLICY "Lecture publique des recettes publiées"
+  ON public.recipes FOR SELECT USING (is_published = true);
+CREATE POLICY "Lecture publique des ingrédients"
+  ON public.recipe_ingredients FOR SELECT USING (true);
+CREATE POLICY "Lecture publique des étapes"
+  ON public.recipe_steps FOR SELECT USING (true);
+
+CREATE POLICY "Lecture publique des articles publiés"
+  ON public.articles FOR SELECT USING (is_published = true);
+
+CREATE POLICY "Gestion de ses produits favoris"
+  ON public.user_saved_products FOR ALL USING (auth.uid() = user_id);
+CREATE POLICY "Gestion de ses recettes favorites"
+  ON public.user_saved_recipes FOR ALL USING (auth.uid() = user_id);
+CREATE POLICY "Gestion de ses articles lus"
+  ON public.user_read_articles FOR ALL USING (auth.uid() = user_id);
+
+CREATE POLICY "Gestion de ses listes de courses"
+  ON public.shopping_lists FOR ALL USING (auth.uid() = user_id);
+CREATE POLICY "Gestion des items de ses listes"
+  ON public.shopping_list_items FOR ALL
+  USING (EXISTS (
+    SELECT 1 FROM public.shopping_lists sl
+    WHERE sl.id = shopping_list_id AND sl.user_id = auth.uid()
+  ));
+
+CREATE POLICY "Lecture publique des partenaires actifs"
+  ON public.partners FOR SELECT USING (is_active = true);
+CREATE POLICY "Modification par le propriétaire du commerce"
+  ON public.partners FOR UPDATE USING (auth.uid() = owner_id);
+
+CREATE POLICY "Lecture publique de l'inventaire disponible"
+  ON public.partner_inventory FOR SELECT USING (is_available = true);
+CREATE POLICY "Gestion de l'inventaire par le partenaire"
+  ON public.partner_inventory FOR ALL
+  USING (EXISTS (
+    SELECT 1 FROM public.partners p
+    WHERE p.id = partner_id AND p.owner_id = auth.uid()
+  ));
+
+CREATE POLICY "Alertes visibles par le nutritionniste et le patient"
+  ON public.patient_alerts FOR SELECT
+  USING (auth.uid() = nutritionist_id OR auth.uid() = patient_id);
+CREATE POLICY "Création d'alertes par le nutritionniste"
+  ON public.patient_alerts FOR INSERT
+  WITH CHECK (auth.uid() = nutritionist_id);
+
+-- ── 18. DONNÉES INITIALES ─────────────────────────────────────
+
+-- 4 articles pour la page /learn
+INSERT INTO public.articles
+  (title, slug, excerpt, content, category, read_time_min, difficulty, tags, is_published, published_at)
+VALUES
+(
+  'Indice Glycémique : Le Guide',
+  'indice-glycemique-guide',
+  'Comprendre l''indice glycémique pour mieux gérer sa glycémie au quotidien.',
+  '## L''Indice Glycémique (IG)
+
+L''IG classe les aliments selon leur effet sur la glycémie.
+
+### Les 3 niveaux
+- **IG bas (< 55)** : lentilles, pois chiches, pommes
+- **IG moyen (55–70)** : riz basmati, pain complet
+- **IG élevé (> 70)** : pain blanc, sodas
+
+### Conseil
+Combinez toujours un aliment à IG élevé avec des fibres ou des protéines.',
+  'glycemic_index', 8, 'beginner',
+  ARRAY['ig','diabete','glycemie'], true, now()
+),
+(
+  'Lire les étiquettes sans stress',
+  'lire-etiquettes',
+  'Guide pratique pour bien choisir ses produits en supermarché.',
+  '## Lire une étiquette alimentaire
+
+### Ingrédients
+Listés par ordre décroissant de poids. Méfiez-vous des sucres cachés : dextrose, sirop de glucose, maltose.
+
+### Tableau nutritionnel
+Comparez toujours les valeurs pour 100g.
+
+### Labels
+- **Bio** : sans pesticides de synthèse
+- **Sans gluten** : pour les cœliaques',
+  'labels', 12, 'intermediate',
+  ARRAY['etiquettes','sante','courses'], true, now()
+),
+(
+  'Les Bonnes vs Mauvaises Graisses',
+  'bonnes-mauvaises-graisses',
+  'Toutes les graisses ne se valent pas. Apprenez à faire la différence.',
+  '## Graisses : lesquelles choisir ?
+
+### À privilégier (insaturées)
+- Oméga-3 : poisson gras, noix, lin
+- Oméga-9 : huile d''olive, avocat
+
+### À limiter (saturées)
+Viandes grasses, beurre, charcuterie.
+
+### À éviter (trans)
+Produits ultra-transformés, margarines hydrogénées.',
+  'fats', 10, 'beginner',
+  ARRAY['graisses','coeur','nutrition'], true, now()
+),
+(
+  'Le secret des céréales complètes',
+  'cereales-completes',
+  'Pourquoi choisir les céréales complètes plutôt que raffinées ?',
+  '## Céréales complètes vs raffinées
+
+Le grain complet conserve son son et son germe.
+
+### Avantages
+- IG plus bas, glycémie stable
+- Plus de fibres, satiété prolongée
+- Plus de magnésium, zinc, vitamines B
+
+### Exemples
+Riz complet, avoine, quinoa, épeautre.',
+  'fiber', 6, 'beginner',
+  ARRAY['cereales','fibres','ig'], true, now()
+);
+
+-- 5 partenaires d'Annaba pour la page /map
+INSERT INTO public.partners
+  (name, address_line, city, country, latitude, longitude, phone, is_active, is_verified, partner_code)
+VALUES
+  ('UNO Hypermarché Annaba', 'Route de Berahal',      'Annaba', 'DZ', 36.9001, 7.7662, '+213 38 000 001', true, true,  '0001-SH'),
+  ('Ardis Market',           'Rue Larbi Ben Mhidi',   'Annaba', 'DZ', 36.8525, 7.7203, '+213 38 000 002', true, false, '0002-SH'),
+  ('Supérette El Hadjar',    'Cité El Hadjar',         'Annaba', 'DZ', 36.8035, 7.7368, '+213 38 000 003', true, false, '0003-SH'),
+  ('Bio Santé Store',        'Centre-ville Annaba',    'Annaba', 'DZ', 36.9050, 7.7700, '+213 38 000 004', true, true,  '0004-SH'),
+  ('Pharma Nutrition+',      'Rue Didouche Mourad',    'Annaba', 'DZ', 36.8200, 7.7300, '+213 38 000 005', true, true,  '0005-SH');
+
+-- Quiz pour l'article IG
+WITH
+  art AS (SELECT id FROM public.articles WHERE slug = 'indice-glycemique-guide'),
+  quiz AS (
+    INSERT INTO public.quizzes (article_id, title)
+    SELECT id, 'Quiz — Testez vos connaissances sur l''IG' FROM art
+    RETURNING id
+  ),
+  q1 AS (
+    INSERT INTO public.quiz_questions (quiz_id, question, sort_order)
+    SELECT id, 'Quel aliment a l''indice glycémique le plus bas ?', 1 FROM quiz
+    RETURNING id
+  )
+INSERT INTO public.quiz_answers (question_id, answer_text, is_correct, explanation, sort_order)
+  SELECT id, 'Lentilles',      true,  'Correct ! Les lentilles ont un IG très bas (~25).', 1 FROM q1
+UNION ALL
+  SELECT id, 'Pain blanc',     false, 'Non, le pain blanc a un IG élevé (~70–75).', 2 FROM q1
+UNION ALL
+  SELECT id, 'Riz instantané', false, 'Non, le riz instantané a un IG très élevé (~85).', 3 FROM q1;
+
+-- ── VÉRIFICATION FINALE ───────────────────────────────────────
+SELECT table_name FROM information_schema.tables
+WHERE table_schema = 'public' ORDER BY table_name;
+
+
+
+
+
+
+------------------  DONNEES  ---------------------------------------- DONNEES------------------------------------ DONNEES -------------------------------- DONNEES ------------------------------
+
+
+
+
+
+-- Catégories déjà insérées (epicerie-salee, fruits-legumes, etc.)
+-- On récupère les IDs via sous-requêtes
+
+INSERT INTO public.products
+  (category_id, name, brand, description, nutri_score, glycemic_index,
+   labels, compatible_with, energy_kcal, carbs_g, sugars_g, fat_g,
+   saturated_fat_g, fiber_g, protein_g, sodium_g, is_published)
+VALUES
+(
+  (SELECT id FROM public.product_categories WHERE slug = 'epicerie-salee'),
+  'Lentilles vertes bio', 'Boni', 'Lentilles vertes biologiques, riches en protéines et fibres.',
+  'A', 25,
+  ARRAY['bio','vegan','sans_gluten','halal'],
+  ARRAY['diabetic','celiac','vegetarian'],
+  352, 60.1, 1.8, 1.1, 0.2, 10.6, 24.6, 0.01, true
+),
+(
+  (SELECT id FROM public.product_categories WHERE slug = 'epicerie-salee'),
+  'Pois chiches en conserve', 'Zitoun', 'Pois chiches cuits, prêts à l''emploi.',
+  'A', 28,
+  ARRAY['vegan','sans_gluten','halal'],
+  ARRAY['diabetic','celiac','vegetarian'],
+  119, 17.8, 0.5, 2.6, 0.3, 6.1, 7.0, 0.32, true
+),
+(
+  (SELECT id FROM public.product_categories WHERE slug = 'epicerie-salee'),
+  'Riz basmati complet', 'El Boustane', 'Riz basmati complet à IG modéré.',
+  'B', 50,
+  ARRAY['vegan','sans_gluten','halal'],
+  ARRAY['diabetic','vegetarian'],
+  350, 77.0, 0.7, 2.7, 0.6, 3.5, 7.5, 0.01, true
+),
+(
+  (SELECT id FROM public.product_categories WHERE slug = 'boulangerie'),
+  'Pain complet au blé entier', 'Rania', 'Pain de mie complet, source de fibres.',
+  'B', 55,
+  ARRAY['vegan','halal'],
+  ARRAY['diabetic','vegetarian'],
+  247, 41.3, 3.4, 4.2, 0.8, 7.4, 9.0, 0.48, true
+),
+(
+  (SELECT id FROM public.product_categories WHERE slug = 'boulangerie'),
+  'Flocons d''avoine', 'Safia', 'Flocons d''avoine complets, idéal pour le petit-déjeuner.',
+  'A', 40,
+  ARRAY['vegan','halal'],
+  ARRAY['diabetic','vegetarian'],
+  389, 66.3, 1.0, 6.9, 1.4, 10.6, 16.9, 0.01, true
+),
+(
+  (SELECT id FROM public.product_categories WHERE slug = 'produits-laitiers'),
+  'Yaourt nature 0%', 'Hodna', 'Yaourt nature sans matières grasses, sans sucres ajoutés.',
+  'A', 35,
+  ARRAY['sans_gluten','halal'],
+  ARRAY['diabetic','celiac'],
+  36, 4.7, 4.7, 0.1, 0.1, 0.0, 3.5, 0.05, true
+),
+(
+  (SELECT id FROM public.product_categories WHERE slug = 'produits-laitiers'),
+  'Fromage blanc maigre', 'Soummam', 'Fromage blanc 0% MG, riche en protéines.',
+  'A', 30,
+  ARRAY['sans_gluten','halal'],
+  ARRAY['diabetic','celiac'],
+  45, 3.5, 3.5, 0.2, 0.1, 0.0, 7.5, 0.04, true
+),
+(
+  (SELECT id FROM public.product_categories WHERE slug = 'fruits-legumes'),
+  'Carottes bio', 'Terroir DZ', 'Carottes fraîches biologiques d''Annaba.',
+  'A', 35,
+  ARRAY['bio','vegan','sans_gluten','halal'],
+  ARRAY['diabetic','celiac','vegetarian'],
+  41, 9.6, 4.7, 0.2, 0.0, 2.8, 0.9, 0.07, true
+),
+(
+  (SELECT id FROM public.product_categories WHERE slug = 'fruits-legumes'),
+  'Avocat Hass', 'Terroir DZ', 'Avocats mûrs, riches en bonnes graisses.',
+  'A', 10,
+  ARRAY['bio','vegan','sans_gluten','halal'],
+  ARRAY['diabetic','celiac','vegetarian'],
+  160, 8.5, 0.3, 14.7, 2.1, 6.7, 2.0, 0.01, true
+),
+(
+  (SELECT id FROM public.product_categories WHERE slug = 'fruits-legumes'),
+  'Pommes Gala', 'Terroir DZ', 'Pommes Gala fraîches, source de fibres solubles.',
+  'A', 38,
+  ARRAY['vegan','sans_gluten','bio','halal'],
+  ARRAY['diabetic','celiac','vegetarian'],
+  52, 13.8, 10.4, 0.2, 0.0, 2.4, 0.3, 0.01, true
+),
+(
+  (SELECT id FROM public.product_categories WHERE slug = 'boissons'),
+  'Eau minérale plate', 'Ifri', 'Eau minérale naturelle d''Ighzer Amokrane.',
+  'A', 0,
+  ARRAY['vegan','sans_gluten','halal'],
+  ARRAY['diabetic','celiac','vegetarian'],
+  0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.01, true
+),
+(
+  (SELECT id FROM public.product_categories WHERE slug = 'epicerie-sucree'),
+  'Miel pur naturel', 'Bejaia Miel', 'Miel toutes fleurs, non pasteurisé.',
+  'C', 65,
+  ARRAY['sans_gluten','halal'],
+  ARRAY['vegetarian'],
+  304, 82.4, 82.4, 0.0, 0.0, 0.2, 0.3, 0.01, true
+)
+ON CONFLICT (barcode) DO NOTHING;
+
+-- Vérification
+SELECT name, nutri_score, glycemic_index FROM public.products ORDER BY name;
+
+-- ── Recette 1 : Salade de lentilles ──────────────────────────
+WITH r AS (
+  INSERT INTO public.recipes
+    (title, description, image_url, prep_time_min, cook_time_min, servings,
+     difficulty, calories_kcal, price_estimate, diet_tags, compatible_with,
+     is_published, is_featured)
+  VALUES (
+    'Salade de Lentilles Méditerranéenne',
+    'Une salade fraîche et nourrissante, idéale pour les diabétiques. Riche en protéines et à IG bas.',
+    NULL,
+    15, 20, 2, 'easy', 320, 350,
+    ARRAY['faible_ig','vegan','sans_gluten','eco'],
+    ARRAY['diabetic','celiac','vegetarian'],
+    true, true
+  ) RETURNING id
+),
+i1 AS (
+  INSERT INTO public.recipe_ingredients (recipe_id, name, quantity, sort_order)
+  SELECT id, 'Lentilles vertes bio', '150g', 1 FROM r
+),
+i2 AS (
+  INSERT INTO public.recipe_ingredients (recipe_id, name, quantity, sort_order)
+  SELECT id, 'Tomates cerises', '100g', 2 FROM r
+),
+i3 AS (
+  INSERT INTO public.recipe_ingredients (recipe_id, name, quantity, sort_order)
+  SELECT id, 'Concombre', '1/2 pièce', 3 FROM r
+),
+i4 AS (
+  INSERT INTO public.recipe_ingredients (recipe_id, name, quantity, sort_order)
+  SELECT id, 'Huile d''olive extra vierge', '2 c.s.', 4 FROM r
+),
+i5 AS (
+  INSERT INTO public.recipe_ingredients (recipe_id, name, quantity, sort_order)
+  SELECT id, 'Jus de citron', '1 c.s.', 5 FROM r
+),
+i6 AS (
+  INSERT INTO public.recipe_ingredients (recipe_id, name, quantity, sort_order)
+  SELECT id, 'Persil frais', '1 bouquet', 6 FROM r
+),
+s1 AS (
+  INSERT INTO public.recipe_steps (recipe_id, step_number, instruction)
+  SELECT id, 1, 'Faire cuire les lentilles 20 minutes dans de l''eau bouillante salée. Égoutter et laisser refroidir.' FROM r
+),
+s2 AS (
+  INSERT INTO public.recipe_steps (recipe_id, step_number, instruction)
+  SELECT id, 2, 'Couper les tomates cerises en deux et le concombre en petits dés.' FROM r
+),
+s3 AS (
+  INSERT INTO public.recipe_steps (recipe_id, step_number, instruction)
+  SELECT id, 3, 'Mélanger les lentilles refroidies avec les légumes.' FROM r
+),
+s4 AS (
+  INSERT INTO public.recipe_steps (recipe_id, step_number, instruction)
+  SELECT id, 4, 'Assaisonner avec l''huile d''olive, le jus de citron, sel et poivre. Parsemer de persil.' FROM r
+)
+SELECT 'Recette 1 insérée' AS status;
+
+
+-- ── Recette 2 : Porridge avoine ───────────────────────────────
+WITH r AS (
+  INSERT INTO public.recipes
+    (title, description, image_url, prep_time_min, cook_time_min, servings,
+     difficulty, calories_kcal, price_estimate, diet_tags, compatible_with,
+     is_published, is_featured)
+  VALUES (
+    'Porridge à l''Avoine & Pomme',
+    'Petit-déjeuner sain à IG modéré. Rassasiant et facile à préparer.',
+    NULL,
+    5, 10, 1, 'easy', 280, 150,
+    ARRAY['faible_ig','vegan','eco'],
+    ARRAY['diabetic','vegetarian'],
+    true, true
+  ) RETURNING id
+),
+i1 AS (
+  INSERT INTO public.recipe_ingredients (recipe_id, name, quantity, sort_order)
+  SELECT id, 'Flocons d''avoine', '60g', 1 FROM r
+),
+i2 AS (
+  INSERT INTO public.recipe_ingredients (recipe_id, name, quantity, sort_order)
+  SELECT id, 'Lait végétal (amande)', '200ml', 2 FROM r
+),
+i3 AS (
+  INSERT INTO public.recipe_ingredients (recipe_id, name, quantity, sort_order)
+  SELECT id, 'Pomme Gala', '1/2 pièce', 3 FROM r
+),
+i4 AS (
+  INSERT INTO public.recipe_ingredients (recipe_id, name, quantity, sort_order)
+  SELECT id, 'Cannelle', '1 pincée', 4 FROM r
+),
+s1 AS (
+  INSERT INTO public.recipe_steps (recipe_id, step_number, instruction)
+  SELECT id, 1, 'Verser les flocons d''avoine et le lait végétal dans une casserole.' FROM r
+),
+s2 AS (
+  INSERT INTO public.recipe_steps (recipe_id, step_number, instruction)
+  SELECT id, 2, 'Faire chauffer à feu moyen en remuant pendant 5 minutes jusqu''à épaississement.' FROM r
+),
+s3 AS (
+  INSERT INTO public.recipe_steps (recipe_id, step_number, instruction)
+  SELECT id, 3, 'Verser dans un bol. Ajouter la demi-pomme coupée en dés et saupoudrer de cannelle.' FROM r
+)
+SELECT 'Recette 2 insérée' AS status;
+
+
+-- ── Recette 3 : Bol de riz basmati au poulet ──────────────────
+WITH r AS (
+  INSERT INTO public.recipes
+    (title, description, image_url, prep_time_min, cook_time_min, servings,
+     difficulty, calories_kcal, price_estimate, diet_tags, compatible_with,
+     is_published, is_featured)
+  VALUES (
+    'Bol Riz Basmati & Poulet Grillé',
+    'Plat complet équilibré. Protéines maigres, glucides à IG modéré et légumes.',
+    NULL,
+    10, 25, 2, 'medium', 420, 600,
+    ARRAY['faible_ig','sans_gluten'],
+    ARRAY['diabetic','celiac'],
+    true, false
+  ) RETURNING id
+),
+i1 AS (
+  INSERT INTO public.recipe_ingredients (recipe_id, name, quantity, sort_order)
+  SELECT id, 'Riz basmati complet', '150g (sec)', 1 FROM r
+),
+i2 AS (
+  INSERT INTO public.recipe_ingredients (recipe_id, name, quantity, sort_order)
+  SELECT id, 'Blanc de poulet', '200g', 2 FROM r
+),
+i3 AS (
+  INSERT INTO public.recipe_ingredients (recipe_id, name, quantity, sort_order)
+  SELECT id, 'Carottes bio', '2 pièces', 3 FROM r
+),
+i4 AS (
+  INSERT INTO public.recipe_ingredients (recipe_id, name, quantity, sort_order)
+  SELECT id, 'Huile d''olive', '1 c.s.', 4 FROM r
+),
+i5 AS (
+  INSERT INTO public.recipe_ingredients (recipe_id, name, quantity, sort_order)
+  SELECT id, 'Épices (curcuma, cumin)', '1 c.c.', 5 FROM r
+),
+s1 AS (
+  INSERT INTO public.recipe_steps (recipe_id, step_number, instruction)
+  SELECT id, 1, 'Faire cuire le riz basmati selon les instructions (environ 20 minutes).' FROM r
+),
+s2 AS (
+  INSERT INTO public.recipe_steps (recipe_id, step_number, instruction)
+  SELECT id, 2, 'Griller le blanc de poulet avec les épices dans une poêle antiadhésive huilée.' FROM r
+),
+s3 AS (
+  INSERT INTO public.recipe_steps (recipe_id, step_number, instruction)
+  SELECT id, 3, 'Faire revenir les carottes en rondelles jusqu''à tendreté.' FROM r
+),
+s4 AS (
+  INSERT INTO public.recipe_steps (recipe_id, step_number, instruction)
+  SELECT id, 4, 'Dresser le riz dans un bol, ajouter le poulet tranché et les carottes.' FROM r
+)
+SELECT 'Recette 3 insérée' AS status;
+
+
+-- ── Recette 4 : Smoothie avocat ───────────────────────────────
+WITH r AS (
+  INSERT INTO public.recipes
+    (title, description, image_url, prep_time_min, cook_time_min, servings,
+     difficulty, calories_kcal, price_estimate, diet_tags, compatible_with,
+     is_published, is_featured)
+  VALUES (
+    'Smoothie Avocat & Yaourt Nature',
+    'Boisson onctueuse riche en bonnes graisses et protéines. Sans sucres ajoutés.',
+    NULL,
+    5, 0, 1, 'easy', 210, 200,
+    ARRAY['faible_ig','sans_gluten','keto'],
+    ARRAY['diabetic','celiac','vegetarian'],
+    true, true
+  ) RETURNING id
+),
+i1 AS (
+  INSERT INTO public.recipe_ingredients (recipe_id, name, quantity, sort_order)
+  SELECT id, 'Avocat Hass', '1/2 pièce', 1 FROM r
+),
+i2 AS (
+  INSERT INTO public.recipe_ingredients (recipe_id, name, quantity, sort_order)
+  SELECT id, 'Yaourt nature 0%', '150g', 2 FROM r
+),
+i3 AS (
+  INSERT INTO public.recipe_ingredients (recipe_id, name, quantity, sort_order)
+  SELECT id, 'Eau minérale', '100ml', 3 FROM r
+),
+i4 AS (
+  INSERT INTO public.recipe_ingredients (recipe_id, name, quantity, sort_order)
+  SELECT id, 'Jus de citron', '1/2 c.c.', 4 FROM r
+),
+s1 AS (
+  INSERT INTO public.recipe_steps (recipe_id, step_number, instruction)
+  SELECT id, 1, 'Couper l''avocat en morceaux et le mettre dans le blender.' FROM r
+),
+s2 AS (
+  INSERT INTO public.recipe_steps (recipe_id, step_number, instruction)
+  SELECT id, 2, 'Ajouter le yaourt, l''eau et le jus de citron.' FROM r
+),
+s3 AS (
+  INSERT INTO public.recipe_steps (recipe_id, step_number, instruction)
+  SELECT id, 3, 'Mixer jusqu''à obtenir une consistance lisse. Servir immédiatement.' FROM r
+)
+SELECT 'Recette 4 insérée' AS status;
+
+-- Vérification
+SELECT title, difficulty, calories_kcal, is_featured FROM public.recipes ORDER BY created_at;
+
+------------------===========================================================================================================================================
+
+-- Lier les produits existants aux 5 partenaires d'Annaba
+INSERT INTO public.partner_inventory
+  (partner_id, product_id, price, currency, quantity, is_available, low_stock_threshold)
+SELECT
+  p.id AS partner_id,
+  pr.id AS product_id,
+  CASE pr.name
+    WHEN 'Lentilles vertes bio'       THEN 180.00
+    WHEN 'Pois chiches en conserve'   THEN 95.00
+    WHEN 'Riz basmati complet'        THEN 220.00
+    WHEN 'Pain complet au blé entier' THEN 65.00
+    WHEN 'Flocons d''avoine'          THEN 145.00
+    WHEN 'Yaourt nature 0%'           THEN 45.00
+    WHEN 'Fromage blanc maigre'       THEN 85.00
+    WHEN 'Carottes bio'               THEN 60.00
+    WHEN 'Avocat Hass'                THEN 120.00
+    WHEN 'Pommes Gala'                THEN 90.00
+    WHEN 'Eau minérale plate'         THEN 25.00
+    WHEN 'Miel pur naturel'           THEN 850.00
+    ELSE 100.00
+  END AS price,
+  'DZD',
+  CASE pr.name
+    WHEN 'Lentilles vertes bio'       THEN 50
+    WHEN 'Pois chiches en conserve'   THEN 80
+    WHEN 'Riz basmati complet'        THEN 60
+    WHEN 'Pain complet au blé entier' THEN 30
+    WHEN 'Flocons d''avoine'          THEN 40
+    WHEN 'Yaourt nature 0%'           THEN 100
+    WHEN 'Fromage blanc maigre'       THEN 60
+    WHEN 'Carottes bio'               THEN 25
+    WHEN 'Avocat Hass'                THEN 15
+    WHEN 'Pommes Gala'                THEN 45
+    WHEN 'Eau minérale plate'         THEN 200
+    WHEN 'Miel pur naturel'           THEN 8
+    ELSE 20
+  END AS quantity,
+  true AS is_available,
+  5 AS low_stock_threshold
+FROM public.partners p
+CROSS JOIN public.products pr
+WHERE p.partner_code IN ('0001-SH', '0002-SH', '0004-SH')
+ON CONFLICT (partner_id, product_id) DO NOTHING;
+
+-- Partenaire 0003-SH et 0005-SH : stock limité (seulement certains produits)
+INSERT INTO public.partner_inventory
+  (partner_id, product_id, price, currency, quantity, is_available, low_stock_threshold)
+SELECT
+  p.id,
+  pr.id,
+  CASE pr.name
+    WHEN 'Yaourt nature 0%'     THEN 42.00
+    WHEN 'Fromage blanc maigre' THEN 80.00
+    WHEN 'Eau minérale plate'   THEN 22.00
+    WHEN 'Carottes bio'         THEN 55.00
+    WHEN 'Pommes Gala'          THEN 85.00
+    ELSE 110.00
+  END,
+  'DZD',
+  CASE pr.name
+    WHEN 'Yaourt nature 0%'     THEN 30
+    WHEN 'Fromage blanc maigre' THEN 20
+    WHEN 'Eau minérale plate'   THEN 80
+    WHEN 'Carottes bio'         THEN 10
+    WHEN 'Pommes Gala'          THEN 18
+    ELSE 5
+  END,
+  true, 3
+FROM public.partners p
+CROSS JOIN public.products pr
+WHERE p.partner_code IN ('0003-SH', '0005-SH')
+  AND pr.name IN ('Yaourt nature 0%','Fromage blanc maigre','Eau minérale plate','Carottes bio','Pommes Gala')
+ON CONFLICT (partner_id, product_id) DO NOTHING;
+
+SELECT 'Partner inventory inséré : ' || COUNT(*) || ' lignes' AS status
+FROM public.partner_inventory;
+
+
+------------------------------------------------------------------------------------------------------------------
+
+-- Pour tester les alertes, on crée des alertes fictives
+-- IMPORTANT : Ces alertes nécessitent de vrais UUID de profils utilisateurs.
+-- Ce bloc sera utile une fois que des utilisateurs se sont inscrits.
+-- Voici le template à utiliser quand tu auras les IDs :
+
+-- INSERT INTO public.patient_alerts
+--   (nutritionist_id, patient_id, type, title, message)
+-- VALUES
+-- (
+--   'UUID_NUTRITIONNISTE_ICI',
+--   'UUID_PATIENT_ICI',
+--   'warning',
+--   'Glycémie élevée détectée',
+--   'Votre consommation de glucides rapides cette semaine est au-dessus de votre seuil recommandé. Pensez à privilégier les aliments à IG bas comme les lentilles et le riz basmati complet.'
+-- ),
+-- (
+--   'UUID_NUTRITIONNISTE_ICI',
+--   'UUID_PATIENT_ICI',
+--   'success',
+--   'Objectif fibres atteint',
+--   'Bravo ! Vous avez atteint votre objectif hebdomadaire de 25g de fibres par jour. Continuez ainsi !'
+-- ),
+-- (
+--   'UUID_NUTRITIONNISTE_ICI',
+--   'UUID_PATIENT_ICI',
+--   'info',
+--   'Nouveau plan alimentaire disponible',
+--   'Votre nutritionniste a mis à jour votre plan alimentaire pour le mois de mai. Consultez la section Recettes.'
+-- );
+
+SELECT 'Alertes : à insérer après inscription de vrais utilisateurs' AS note;
+
+
+----------------------------------------------------------------------------------------------------------------------
+
+-- Logs de recherche pour alimenter les analytics du dashboard partenaire
+-- À insérer après avoir de vrais utilisateurs, voici la structure :
+
+INSERT INTO public.product_search_logs
+  (partner_id, product_id, search_term)
+SELECT
+  p.id,
+  pr.id,
+  t.term
+FROM public.partners p
+CROSS JOIN public.products pr
+CROSS JOIN (VALUES
+  ('lentilles'), ('riz'), ('yaourt'), ('avocat'),
+  ('sans gluten'), ('diabétique'), ('bio')
+) AS t(term)
+WHERE p.partner_code = '0001-SH'
+  AND pr.name IN ('Lentilles vertes bio','Riz basmati complet','Yaourt nature 0%','Avocat Hass')
+LIMIT 20;
+
+SELECT 'Search logs insérés' AS status;
+
+
+------------------------------------------------------------------------------------------------------
+
+-- Générer des vues fictives pour les 30 derniers jours (pour les graphiques du dashboard partenaire)
+INSERT INTO public.partner_product_views (partner_id, product_id, viewed_at)
+SELECT
+  p.id,
+  pr.id,
+  now() - (random() * interval '30 days')
+FROM public.partners p
+CROSS JOIN public.products pr
+CROSS JOIN generate_series(1, 5) AS gs
+WHERE p.partner_code IN ('0001-SH', '0002-SH')
+ORDER BY random()
+LIMIT 100;
+
+SELECT 'Vues insérées : ' || COUNT(*) || ' lignes' AS status
+FROM public.partner_product_views;
+
+------------------------------------------------------------===========================================-------------------------------------------------------------
+
+SELECT 'profiles'           AS table_name, COUNT(*) AS lignes FROM public.profiles
+UNION ALL
+SELECT 'partners',           COUNT(*) FROM public.partners
+UNION ALL
+SELECT 'products',           COUNT(*) FROM public.products
+UNION ALL
+SELECT 'product_categories', COUNT(*) FROM public.product_categories
+UNION ALL
+SELECT 'partner_inventory',  COUNT(*) FROM public.partner_inventory
+UNION ALL
+SELECT 'recipes',            COUNT(*) FROM public.recipes
+UNION ALL
+SELECT 'recipe_ingredients', COUNT(*) FROM public.recipe_ingredients
+UNION ALL
+SELECT 'recipe_steps',       COUNT(*) FROM public.recipe_steps
+UNION ALL
+SELECT 'articles',           COUNT(*) FROM public.articles
+UNION ALL
+SELECT 'quizzes',            COUNT(*) FROM public.quizzes
+UNION ALL
+SELECT 'quiz_questions',     COUNT(*) FROM public.quiz_questions
+UNION ALL
+SELECT 'quiz_answers',       COUNT(*) FROM public.quiz_answers
+UNION ALL
+SELECT 'product_search_logs',COUNT(*) FROM public.product_search_logs
+UNION ALL
+SELECT 'partner_product_views', COUNT(*) FROM public.partner_product_views
+ORDER BY table_name;
+
+
+----------------====================================================================================================================================================
+INSERT INTO public.product_search_logs
+  (partner_id, product_id, search_term)
+SELECT
+  p.id,
+  pr.id,
+  t.term
+FROM public.partners p
+CROSS JOIN public.products pr
+CROSS JOIN (VALUES
+  ('lentilles'), ('riz'), ('yaourt'), ('avocat'),
+  ('sans gluten'), ('diabétique'), ('bio')
+) AS t(term)
+WHERE p.partner_code = '0001-SH'
+  AND pr.name IN ('Lentilles vertes bio','Riz basmati complet','Yaourt nature 0%','Avocat Hass')
+LIMIT 20;
+
+SELECT 'Search logs insérés : ' || COUNT(*) || ' lignes' AS status
+FROM public.product_search_logs;
+
+
+
+
+INSERT INTO public.partner_product_views (partner_id, product_id, viewed_at)
+SELECT
+  p.id,
+  pr.id,
+  now() - (random() * interval '30 days')
+FROM public.partners p
+CROSS JOIN public.products pr
+CROSS JOIN generate_series(1, 5) AS gs
+WHERE p.partner_code IN ('0001-SH', '0002-SH')
+ORDER BY random()
+LIMIT 100;
+
+SELECT 'Vues insérées : ' || COUNT(*) || ' lignes' AS status
+FROM public.partner_product_views;
+
+
+SELECT 'profiles'               AS table_name, COUNT(*) AS lignes FROM public.profiles
+UNION ALL SELECT 'partners',             COUNT(*) FROM public.partners
+UNION ALL SELECT 'products',             COUNT(*) FROM public.products
+UNION ALL SELECT 'product_categories',   COUNT(*) FROM public.product_categories
+UNION ALL SELECT 'partner_inventory',    COUNT(*) FROM public.partner_inventory
+UNION ALL SELECT 'recipes',              COUNT(*) FROM public.recipes
+UNION ALL SELECT 'recipe_ingredients',   COUNT(*) FROM public.recipe_ingredients
+UNION ALL SELECT 'recipe_steps',         COUNT(*) FROM public.recipe_steps
+UNION ALL SELECT 'articles',             COUNT(*) FROM public.articles
+UNION ALL SELECT 'quizzes',              COUNT(*) FROM public.quizzes
+UNION ALL SELECT 'quiz_questions',       COUNT(*) FROM public.quiz_questions
+UNION ALL SELECT 'quiz_answers',         COUNT(*) FROM public.quiz_answers
+UNION ALL SELECT 'product_search_logs',  COUNT(*) FROM public.product_search_logs
+UNION ALL SELECT 'partner_product_views',COUNT(*) FROM public.partner_product_views
+ORDER BY table_name;
+
+
+-- ── PRODUITS ──────────────────────────────────────────────────
+UPDATE public.products SET
+  image_url = 'https://pplx-res.cloudinary.com/image/upload/pplx_search_images/4c425e1dd3c650e73d427c53839911031a3fe31c.jpg'
+WHERE name = 'Lentilles vertes bio';
+
+UPDATE public.products SET
+  image_url = 'https://pplx-res.cloudinary.com/image/upload/pplx_search_images/762c97fde5ec0f6c9a35df50c13b28c0dbb18372.jpg'
+WHERE name = 'Pois chiches en conserve';
+
+UPDATE public.products SET
+  image_url = 'https://pplx-res.cloudinary.com/image/upload/pplx_search_images/8667b3aff8218893bff9f215a86e81acfbd8d2d9.jpg'
+WHERE name = 'Riz basmati complet';
+
+UPDATE public.products SET
+  image_url = 'https://pplx-res.cloudinary.com/image/upload/pplx_search_images/84aaed72504724405afd8fe294df501ec4247863.jpg'
+WHERE name = 'Pain complet au blé entier';
+
+UPDATE public.products SET
+  image_url = 'https://pplx-res.cloudinary.com/image/upload/pplx_search_images/0c1df724e2da49e7024363a4e47c718e60c27071.jpg'
+WHERE name = 'Flocons d''avoine';
+
+UPDATE public.products SET
+  image_url = 'https://pplx-res.cloudinary.com/image/upload/pplx_search_images/e0fee32ee0e2d871da9f82da60c6135627aa13f6.jpg'
+WHERE name = 'Yaourt nature 0%';
+
+UPDATE public.products SET
+  image_url = 'https://pplx-res.cloudinary.com/image/upload/pplx_search_images/e59dc78e7752eb23f5bcecad186b41f36ff9026b.jpg'
+WHERE name = 'Fromage blanc maigre';
+
+UPDATE public.products SET
+  image_url = 'https://pplx-res.cloudinary.com/image/upload/pplx_search_images/7055e0b7475c8fbf659c6c94afc6d16a551c53e3.jpg'
+WHERE name = 'Carottes bio';
+
+UPDATE public.products SET
+  image_url = 'https://pplx-res.cloudinary.com/image/upload/pplx_search_images/ec96b7851ad85cfcc480e6b5ab5125efd7c8dc45.jpg'
+WHERE name = 'Avocat Hass';
+
+UPDATE public.products SET
+  image_url = 'https://pplx-res.cloudinary.com/image/upload/pplx_search_images/8e7ce8c110e00fb53d2aa1070b841755be5d7f7a.jpg'
+WHERE name = 'Pommes Gala';
+
+UPDATE public.products SET
+  image_url = 'https://pplx-res.cloudinary.com/image/upload/pplx_search_images/d97effe60a6c45fb01296ceb35c79ad439f1029e.jpg'
+WHERE name = 'Eau minérale plate';
+
+UPDATE public.products SET
+  image_url = 'https://pplx-res.cloudinary.com/image/upload/pplx_search_images/e0ea5bab7578d934c277e8a2a5cb61fd148ae333.jpg'
+WHERE name = 'Miel pur naturel';
+
+-- Vérification
+SELECT name, image_url IS NOT NULL AS a_une_image FROM public.products ORDER BY name;
+
+
+
+
+-- ── RECETTES ──────────────────────────────────────────────────
+UPDATE public.recipes SET
+  image_url = 'https://pplx-res.cloudinary.com/image/upload/pplx_search_images/293a828890362cd8c32a6a91cc650459bcb8ff98.jpg'
+WHERE title = 'Salade de Lentilles Méditerranéenne';
+
+UPDATE public.recipes SET
+  image_url = 'https://pplx-res.cloudinary.com/image/upload/pplx_search_images/1c72cecb713aecc3b53ad65dfac6d28705ed2f89.jpg'
+WHERE title = 'Porridge à l''Avoine & Pomme';
+
+UPDATE public.recipes SET
+  image_url = 'https://pplx-res.cloudinary.com/image/upload/pplx_search_images/9f33d14913a2c582fb486c51daeb6055eea448d6.jpg'
+WHERE title = 'Bol Riz Basmati & Poulet Grillé';
+
+UPDATE public.recipes SET
+  image_url = 'https://pplx-res.cloudinary.com/image/upload/pplx_search_images/a5b7d616c722606f77bdcf8e33ee92d9127aaa2e.jpg'
+WHERE title = 'Smoothie Avocat & Yaourt Nature';
+
+-- Vérification
+SELECT title, image_url IS NOT NULL AS a_une_image FROM public.recipes ORDER BY title;
+
+
+
+
+
+
+SELECT name, brand, image_url
+FROM public.products
+ORDER BY name;
+
+
+SELECT title, is_published, is_featured FROM public.recipes;
+
+
+
+
+SELECT id, name, brand, image_url
+FROM public.products
+ORDER BY name;
+
+SELECT id, title, is_published, is_featured, image_url
+FROM public.recipes
+ORDER BY title;
+
+SELECT id, name, city, is_active
+FROM public.partners
+ORDER BY name;
+
+
+
+
+UPDATE public.products
+SET name = 'Flocons d''Avoine Entiers Bio'
+WHERE name = 'Flocons d''avoine';
+
+UPDATE public.products
+SET name = 'Lentilles Vertes Sèches'
+WHERE name = 'Lentilles vertes bio';
+
+UPDATE public.products
+SET name = 'Pois Chiches Secs Bio'
+WHERE name = 'Pois chiches en conserve';
+
+
+
+
+-- ── PRODUITS — URLs permanentes ───────────────────────────────
+
+UPDATE public.products SET image_url =
+  'https://images.unsplash.com/photo-1612257999756-c9e4da1b1e99?w=400'
+WHERE name ILIKE '%lentill%';
+
+UPDATE public.products SET image_url =
+  'https://images.unsplash.com/photo-1515543237350-b3eea1ec8082?w=400'
+WHERE name ILIKE '%pois chich%';
+
+UPDATE public.products SET image_url =
+  'https://images.unsplash.com/photo-1536304993881-ff86e0c9c7ce?w=400'
+WHERE name ILIKE '%riz%';
+
+UPDATE public.products SET image_url =
+  'https://images.unsplash.com/photo-1509440159596-0249088772ff?w=400'
+WHERE name ILIKE '%pain%';
+
+UPDATE public.products SET image_url =
+  'https://images.unsplash.com/photo-1614961233913-a5113a4a34ed?w=400'
+WHERE name ILIKE '%flocon%' OR name ILIKE '%avoine%';
+
+UPDATE public.products SET image_url =
+  'https://images.unsplash.com/photo-1571212515416-fca988083d3c?w=400'
+WHERE name ILIKE '%yaourt%';
+
+UPDATE public.products SET image_url =
+  'https://images.unsplash.com/photo-1486297678162-eb2a19b0a318?w=400'
+WHERE name ILIKE '%fromage blanc%';
+
+UPDATE public.products SET image_url =
+  'https://images.unsplash.com/photo-1598170845058-32b9d6a5da37?w=400'
+WHERE name ILIKE '%carott%';
+
+UPDATE public.products SET image_url =
+  'https://images.unsplash.com/photo-1523049673857-eb18f1d7b578?w=400'
+WHERE name ILIKE '%avocat%';
+
+UPDATE public.products SET image_url =
+  'https://images.unsplash.com/photo-1568702846914-96b305d2aaeb?w=400'
+WHERE name ILIKE '%pomm%';
+
+UPDATE public.products SET image_url =
+  'https://images.unsplash.com/photo-1548839140-29a749e1cf4d?w=400'
+WHERE name ILIKE '%eau min%';
+
+UPDATE public.products SET image_url =
+  'https://images.unsplash.com/photo-1587049352846-4a222e784d38?w=400'
+WHERE name ILIKE '%miel%';
+
+-- ── RECETTES — URLs permanentes ───────────────────────────────
+
+UPDATE public.recipes SET image_url =
+  'https://images.unsplash.com/photo-1512621776951-a57141f2eefd?w=400'
+WHERE title ILIKE '%lentill%';
+
+UPDATE public.recipes SET image_url =
+  'https://images.unsplash.com/photo-1517673132405-a56a62b18caf?w=400'
+WHERE title ILIKE '%porridge%';
+
+UPDATE public.recipes SET image_url =
+  'https://images.unsplash.com/photo-1546069901-ba9599a7e63c?w=400'
+WHERE title ILIKE '%riz%' OR title ILIKE '%poulet%';
+
+UPDATE public.recipes SET image_url =
+  'https://images.unsplash.com/photo-1638176067095-17c88e0238f9?w=400'
+WHERE title ILIKE '%smoothie%' OR title ILIKE '%avocat%';
+
+-- ── VÉRIFICATION ──────────────────────────────────────────────
+SELECT name, LEFT(image_url, 60) AS url_debut
+FROM public.products ORDER BY name;
+
+SELECT title, LEFT(image_url, 60) AS url_debut
+FROM public.recipes ORDER BY title;
+
+
+
+
+
+
+-- Produits : image unique par produit via son UUID
+UPDATE public.products
+SET image_url = 'https://picsum.photos/seed/' || id::text || '/600/400'
+WHERE image_url LIKE '%unsplash.com%';
+
+-- Recettes : idem
+UPDATE public.recipes
+SET image_url = 'https://picsum.photos/seed/' || id::text || '/600/400'
+WHERE image_url LIKE '%unsplash.com%';
+
+-- Vérification (doit retourner 0 lignes)
+SELECT id, name, image_url FROM public.products WHERE image_url LIKE '%unsplash.com%';
+SELECT id, title, image_url FROM public.recipes WHERE image_url LIKE '%unsplash.com%';
+
+
+-- Voir les URLs actuelles
+SELECT id, name, image_url 
+FROM public.products 
+LIMIT 10;
+
+SELECT id, title, image_url 
+FROM public.recipes 
+LIMIT 5;
+
+
+-- UPDATE produits
+UPDATE public.products
+SET image_url = 'https://picsum.photos/seed/' || id::text || '/600/400'
+WHERE image_url LIKE '%unsplash%' OR image_url IS NULL;
+
+-- UPDATE recettes  
+UPDATE public.recipes
+SET image_url = 'https://picsum.photos/seed/' || id::text || '/600/400'
+WHERE image_url LIKE '%unsplash%' OR image_url IS NULL;
+
+-- Confirmation : doit afficher 0 lignes
+SELECT COUNT(*) as reste_unsplash FROM public.products 
+WHERE image_url LIKE '%unsplash%';
+
+SELECT COUNT(*) as reste_unsplash FROM public.recipes 
+WHERE image_url LIKE '%unsplash%';
+
+
+
+
+
+
+
+
+
+-- Mettre à jour les UUIDs des catégories pour correspondre au CSV
+UPDATE public.product_categories SET id = 'f8a49f40-1710-5b0e-9df1-e60ce2bc4acc' WHERE slug = 'epicerie-salee';
+UPDATE public.product_categories SET id = '34c07ae3-b15d-5a36-8e58-718ee3c4a6bf' WHERE slug = 'produits-laitiers';
+UPDATE public.product_categories SET id = '9df4ad90-803c-5100-a325-42b0ed84e1b5' WHERE slug = 'boissons';
+UPDATE public.product_categories SET id = '547ad401-05bd-58e4-a4ef-593f975d0499' WHERE slug = 'boulangerie';
+UPDATE public.product_categories SET id = 'aed25f4b-771a-52bb-8613-c8134fac3e3e' WHERE slug = 'fruits-legumes';
+UPDATE public.product_categories SET id = '78007049-5509-5121-b7df-5428d7299161' WHERE slug = 'epicerie-sucree';
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+-- Remplacer les images Unsplash mortes par Picsum Photos (toujours disponible)
+UPDATE products
+SET image_url = 'https://picsum.photos/seed/' || id || '/400/300'
+WHERE image_url LIKE '%unsplash.com%'
+   OR image_url IS NULL
+   OR image_url = '';
+
+UPDATE recipes  
+SET image_url = 'https://picsum.photos/seed/' || id || '/600/400'
+WHERE image_url LIKE '%unsplash.com%'
+   OR image_url IS NULL
+   OR image_url = '';
+
+
+-- Seulement les tables qui ont image_url
+UPDATE products
+SET image_url = 'https://picsum.photos/seed/' || id || '/400/300'
+WHERE image_url LIKE '%unsplash%';
+
+UPDATE recipes
+SET image_url = 'https://picsum.photos/seed/' || id || '/600/400'
+WHERE image_url LIKE '%unsplash%';
+
+
+
+
+-- Partners
+SELECT 'partners - logo_url' as source, id, logo_url as url
+FROM partners WHERE logo_url LIKE '%unsplash%';
+
+
+SELECT 'partners - cover_url' as source, id, cover_url as url
+FROM partners WHERE cover_url LIKE '%unsplash%';
+
+
+-- Articles
+SELECT 'articles - image_url' as source, id, image_url as url
+FROM articles WHERE image_url LIKE '%unsplash%';
+
+
+-- Profiles  
+SELECT 'profiles - avatar_url' as source, id, avatar_url as url
+FROM profiles WHERE avatar_url LIKE '%unsplash%';
+
+
+-- products image_urls (array)
+SELECT id, image_urls 
+FROM products 
+WHERE image_urls::text LIKE '%unsplash%'
+LIMIT 5;
+
+SELECT id, image_url FROM products 
+WHERE image_url NOT LIKE '%picsum%' 
+AND image_url IS NOT NULL
+LIMIT 10;
+
+
+
+
+
+
+-- Assigner diet_tags selon le contenu
+UPDATE recipes SET diet_tags = ARRAY[]::text[] WHERE diet_tags IS NULL;
+
+-- faible_ig : lentilles, quinoa, haricots, pois chiches, courgettes
+UPDATE recipes SET diet_tags = array_append(diet_tags, 'faible_ig')
+WHERE (title ILIKE '%lentil%' OR title ILIKE '%quinoa%' OR title ILIKE '%pois chiche%'
+    OR title ILIKE '%haricot%' OR title ILIKE '%courgette%' OR title ILIKE '%avocat%'
+    OR description ILIKE '%IG bas%' OR description ILIKE '%diabét%')
+AND NOT (diet_tags @> ARRAY['faible_ig']);
+
+-- sans_gluten : sarrasin, quinoa, riz, sans gluten, sans farine
+UPDATE recipes SET diet_tags = array_append(diet_tags, 'sans_gluten')
+WHERE (title ILIKE '%sarrasin%' OR title ILIKE '%quinoa%' OR title ILIKE '%sans gluten%'
+    OR title ILIKE '%sans farine%' OR description ILIKE '%sans gluten%' OR description ILIKE '%cœliaque%')
+AND NOT (diet_tags @> ARRAY['sans_gluten']);
+
+-- vegan : salade, légumes, smoothie, soupe végétale
+UPDATE recipes SET diet_tags = array_append(diet_tags, 'vegan')
+WHERE (title ILIKE '%salade%' OR title ILIKE '%smoothie%' OR title ILIKE '%taboulé%'
+    OR title ILIKE '%curry%' OR description ILIKE '%végétalien%' OR description ILIKE '%vegan%')
+AND NOT (diet_tags @> ARRAY['vegan']);
+
+-- keto : œufs, fromage, viande, poulet, mousse chocolat
+UPDATE recipes SET diet_tags = array_append(diet_tags, 'keto')
+WHERE (title ILIKE '%œuf%' OR title ILIKE '%omelette%' OR title ILIKE '%poulet%'
+    OR title ILIKE '%mousse%' OR title ILIKE '%fromage%' OR title ILIKE '%wrap%')
+AND NOT (diet_tags @> ARRAY['keto']);
+
+-- eco : légumes, salade, soupe, couscous
+UPDATE recipes SET diet_tags = array_append(diet_tags, 'eco')
+WHERE (title ILIKE '%soupe%' OR title ILIKE '%couscous%' OR title ILIKE '%gratin%'
+    OR title ILIKE '%tarte%' OR title ILIKE '%galette%')
+AND NOT (diet_tags @> ARRAY['eco']);
+
+
+
+
+
+
+
+-- Assigner compatible_with
+UPDATE recipes SET compatible_with = ARRAY[]::text[] WHERE compatible_with IS NULL;
+
+-- diabetic
+UPDATE recipes SET compatible_with = array_append(compatible_with, 'diabetic')
+WHERE (diet_tags @> ARRAY['faible_ig'] OR description ILIKE '%diabét%' OR description ILIKE '%IG bas%')
+AND NOT (compatible_with @> ARRAY['diabetic']);
+
+-- celiac
+UPDATE recipes SET compatible_with = array_append(compatible_with, 'celiac')
+WHERE diet_tags @> ARRAY['sans_gluten']
+AND NOT (compatible_with @> ARRAY['celiac']);
+
+-- vegetarian
+UPDATE recipes SET compatible_with = array_append(compatible_with, 'vegetarian')
+WHERE (diet_tags @> ARRAY['vegan'] OR title ILIKE '%légume%' OR title ILIKE '%quinoa%')
+AND NOT (compatible_with @> ARRAY['vegetarian']);
+
+
+-- Toutes les recettes publiées sont compatibles "healthy"
+-- (Mode Sain = pas de restriction spécifique, toutes les recettes conviennent)
+UPDATE recipes 
+SET compatible_with = array_append(compatible_with, 'healthy')
+WHERE NOT (compatible_with @> ARRAY['healthy'])
+AND is_published = true;
+
+-- Vérification
+SELECT COUNT(*) FROM recipes WHERE compatible_with @> ARRAY['healthy'];
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+-- 1. Voir le profil existant
+SELECT id, email, role
+FROM public.profiles
+WHERE email = 'mez.kad04@gmail.com';
+
+-- 2. Passer le rôle en partner_admin
+UPDATE public.profiles
+SET role = 'partner_admin'
+WHERE email = 'mez.kad04@gmail.com'
+RETURNING id, email, role;
+
+-- 3. Vérifier si un partenaire existe déjà pour ce profil
+SELECT p.id AS partner_id, p.name, p.owner_id
+FROM public.partners p
+JOIN public.profiles pr ON pr.id = p.owner_id
+WHERE pr.email = 'mez.kad04@gmail.com';
+
+-- 4. Créer le partenaire minimal si aucun n'existe
+INSERT INTO public.partners (owner_id, name, country, is_active, is_verified)
+SELECT id, 'magazin zaafrania', 'DZ', true, false
+FROM public.profiles
+WHERE email = 'mez.kad04@gmail.com'
+AND NOT EXISTS (
+  SELECT 1
+  FROM public.partners p
+  WHERE p.owner_id = public.profiles.id
+)
+RETURNING id, name, owner_id, is_active, is_verified;
+
+-- 5. Mettre à jour le nom si le partenaire existe déjà
+UPDATE public.partners
+SET name = 'magazin zaafrania'
+WHERE owner_id = (
+  SELECT id
+  FROM public.profiles
+  WHERE email = 'mez.kad04@gmail.com'
+)
+AND name <> 'magazin zaafrania'
+RETURNING id, name;
+
+INSERT INTO public.partners (
+  owner_id,
+  name,
+  country,
+  is_active,
+  is_verified
+)
+SELECT
+  id,
+  'magazin zaafrania',
+  'DZ',
+  true,
+  false
+FROM public.profiles
+WHERE email = 'mez.kad04@gmail.com'
+RETURNING id, name, owner_id, is_active, is_verified;
+
+
+
+
+SELECT p.id AS partner_id, p.name, p.owner_id, pr.email, pr.role
+FROM public.partners p
+JOIN public.profiles pr ON pr.id = p.owner_id
+WHERE pr.email = 'mez.kad04@gmail.com';
+
+SELECT id, email, role
+FROM public.profiles
+WHERE email = 'mez.kad04@gmail.com';
+
+
+INSERT INTO public.partners (
+  owner_id,
+  name,
+  country,
+  is_active,
+  is_verified
+)
+SELECT
+  id,
+  'magazin zaafrania',
+  'DZ',
+  true,
+  false
+FROM public.profiles
+WHERE email = 'mez.kad04@gmail.com'
+RETURNING id, name, owner_id, is_active, is_verified;
+
+
+SELECT id, email
+FROM auth.users
+ORDER BY created_at DESC
+LIMIT 20;
+
+
+
+INSERT INTO public.profiles (id, email, role)
+VALUES (
+  '18e37501-cf2e-4f67-8da5-5d48113885c9',
+  'kadermezouari02@gmail.com',
+  'partner_admin'
+)
+ON CONFLICT (id) DO UPDATE
+SET email = EXCLUDED.email,
+    role = EXCLUDED.role
+RETURNING id, email, role;
+
+
+
+
+
+INSERT INTO public.partners (
+  owner_id,
+  name,
+  country,
+  is_active,
+  is_verified
+)
+VALUES (
+  '18e37501-cf2e-4f67-8da5-5d48113885c9',
+  'magazin zaafrania',
+  'DZ',
+  true,
+  false
+)
+RETURNING id, name, owner_id, is_active, is_verified;
+
+
+
+
+
+SELECT p.id, p.name, p.owner_id, pr.email, pr.role
+FROM public.partners p
+JOIN public.profiles pr ON pr.id = p.owner_id
+WHERE pr.email = 'kadermezouari02@gmail.com';
+
+
+
+
+
+
+
+-- ============================================================
+-- SmartHeart - Partner catalog migration
+-- ============================================================
+
+-- 1) Table partner_catalog
+CREATE TABLE IF NOT EXISTS public.partner_catalog (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  partner_id UUID NOT NULL REFERENCES public.partners(id) ON DELETE CASCADE,
+  type TEXT NOT NULL CHECK (type IN ('product', 'recipe')),
+  name TEXT NOT NULL,
+  data JSONB NOT NULL DEFAULT '{}'::jsonb,
+  is_published BOOLEAN NOT NULL DEFAULT false,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  CONSTRAINT uq_partner_catalog_name UNIQUE (partner_id, type, name)
+);
+
+-- 2) Index
+CREATE INDEX IF NOT EXISTS idx_partner_catalog_partner_id
+  ON public.partner_catalog(partner_id);
+
+CREATE INDEX IF NOT EXISTS idx_partner_catalog_type
+  ON public.partner_catalog(type);
+
+CREATE INDEX IF NOT EXISTS idx_partner_catalog_published
+  ON public.partner_catalog(is_published)
+  WHERE is_published = true;
+
+-- 3) Trigger function for updated_at
+CREATE OR REPLACE FUNCTION public.update_updated_at_column()
+RETURNS TRIGGER AS $$
+BEGIN
+  NEW.updated_at = now();
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+-- 4) Drop trigger if already exists, then recreate
+DROP TRIGGER IF EXISTS trg_partner_catalog_updated_at
+ON public.partner_catalog;
+
+CREATE TRIGGER trg_partner_catalog_updated_at
+BEFORE UPDATE ON public.partner_catalog
+FOR EACH ROW
+EXECUTE FUNCTION public.update_updated_at_column();
+
+-- 5) Enable RLS
+ALTER TABLE public.partner_catalog ENABLE ROW LEVEL SECURITY;
+
+-- 6) Policies
+DROP POLICY IF EXISTS "Partner reads own catalog" ON public.partner_catalog;
+CREATE POLICY "Partner reads own catalog"
+  ON public.partner_catalog
+  FOR SELECT
+  USING (
+    partner_id IN (
+      SELECT id
+      FROM public.partners
+      WHERE owner_id = auth.uid()
+    )
+  );
+
+DROP POLICY IF EXISTS "Partner inserts own catalog" ON public.partner_catalog;
+CREATE POLICY "Partner inserts own catalog"
+  ON public.partner_catalog
+  FOR INSERT
+  WITH CHECK (
+    partner_id IN (
+      SELECT id
+      FROM public.partners
+      WHERE owner_id = auth.uid()
+    )
+  );
+
+DROP POLICY IF EXISTS "Partner updates own catalog" ON public.partner_catalog;
+CREATE POLICY "Partner updates own catalog"
+  ON public.partner_catalog
+  FOR UPDATE
+  USING (
+    partner_id IN (
+      SELECT id
+      FROM public.partners
+      WHERE owner_id = auth.uid()
+    )
+  );
+
+DROP POLICY IF EXISTS "Partner deletes own catalog" ON public.partner_catalog;
+CREATE POLICY "Partner deletes own catalog"
+  ON public.partner_catalog
+  FOR DELETE
+  USING (
+    partner_id IN (
+      SELECT id
+      FROM public.partners
+      WHERE owner_id = auth.uid()
+    )
+  );
+
+DROP POLICY IF EXISTS "Public reads published catalog" ON public.partner_catalog;
+CREATE POLICY "Public reads published catalog"
+  ON public.partner_catalog
+  FOR SELECT
+  USING (is_published = true);
+
+
+
+
+
+
+  -- Vérifier que la table existe
+SELECT table_name
+FROM information_schema.tables
+WHERE table_schema = 'public'
+  AND table_name = 'partner_catalog';
+
+-- Vérifier les colonnes
+SELECT column_name, data_type
+FROM information_schema.columns
+WHERE table_schema = 'public'
+  AND table_name = 'partner_catalog'
+ORDER BY ordinal_position;
+
+-- Vérifier les policies
+SELECT policyname, permissive, roles, cmd
+FROM pg_policies
+WHERE schemaname = 'public'
+  AND tablename = 'partner_catalog';
+
+
+
+
+
+
+
+-- ── Activer RLS sur les tables quiz existantes ─────────────────
+ALTER TABLE public.quizzes           ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.quiz_questions    ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.quiz_answers      ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.user_quiz_results ENABLE ROW LEVEL SECURITY;
+
+-- Lecture publique (quiz, questions, réponses)
+CREATE POLICY "Lecture publique des quiz"
+  ON public.quizzes FOR SELECT USING (true);
+
+CREATE POLICY "Lecture publique des questions"
+  ON public.quiz_questions FOR SELECT USING (true);
+
+CREATE POLICY "Lecture publique des réponses"
+  ON public.quiz_answers FOR SELECT USING (true);
+
+-- Résultats : accès uniquement à ses propres données
+CREATE POLICY "Lecture de ses propres résultats"
+  ON public.user_quiz_results FOR SELECT
+  USING (auth.uid() = user_id);
+
+CREATE POLICY "Insertion de ses propres résultats"
+  ON public.user_quiz_results FOR INSERT
+  WITH CHECK (auth.uid() = user_id);
+
+CREATE POLICY "Mise à jour de ses propres résultats"
+  ON public.user_quiz_results FOR UPDATE
+  USING (auth.uid() = user_id);
+
+
+  -- ── Contrainte UNIQUE pour éviter les doublons de résultats ────
+ALTER TABLE public.user_quiz_results
+  ADD CONSTRAINT uq_user_quiz UNIQUE (user_id, quiz_id);
+
+
+-- ── patient_alerts : politique UPDATE manquante ────────────────
+CREATE POLICY "Marquer une alerte comme lue"
+  ON public.patient_alerts FOR UPDATE
+  USING  (auth.uid() = patient_id OR auth.uid() = nutritionist_id)
+  WITH CHECK (auth.uid() = patient_id OR auth.uid() = nutritionist_id);
+
+
+
+SELECT table_name FROM information_schema.tables 
+WHERE table_schema = 'public' 
+AND table_name = 'partner_catalog';
+
+
+
+
+-- Vérifier si RLS est déjà activé et quelles policies existent
+SELECT 
+  schemaname, 
+  tablename, 
+  rowsecurity
+FROM pg_tables 
+WHERE tablename = 'partner_catalog';
+
+SELECT policyname, cmd 
+FROM pg_policies 
+WHERE tablename = 'partner_catalog';
+
+
+
+
+ALTER TABLE public.partner_catalog ENABLE ROW LEVEL SECURITY;
+
+CREATE POLICY "Lecture publique du catalogue partenaire"
+  ON public.partner_catalog FOR SELECT USING (is_published = true);
+
+CREATE POLICY "Gestion du catalogue par le partenaire"
+  ON public.partner_catalog FOR ALL
+  USING (EXISTS (
+    SELECT 1 FROM public.partners p
+    WHERE p.id = partner_id AND p.owner_id = auth.uid()
+  ));
+
+
+
+
+-----------------------------------------------------fin---------------------------------------fin-------------------------------------------fin-------------------------------------------------------
+
+
+
+
+
+WITH expected_tables AS (
+  SELECT unnest(ARRAY[
+    'profiles',
+    'userhealthprofiles',
+    'partners',
+    'productcategories',
+    'products',
+    'partnerinventory',
+    'recipes',
+    'recipeingredients',
+    'recipesteps',
+    'articles',
+    'quizzes',
+    'quizquestions',
+    'quizanswers',
+    'userquizresults',
+    'usersavedproducts',
+    'usersavedrecipes',
+    'userreadarticles',
+    'shoppinglists',
+    'shoppinglistitems',
+    'patientalerts',
+    'partnerproductviews',
+    'productsearchlogs'
+  ]) AS table_name
+),
+table_check AS (
+  SELECT
+    e.table_name,
+    CASE WHEN t.table_name IS NOT NULL THEN 'OK' ELSE 'MISSING' END AS status
+  FROM expected_tables e
+  LEFT JOIN information_schema.tables t
+    ON t.table_schema = 'public'
+   AND t.table_name = e.table_name
+),
+role_check AS (
+  SELECT
+    'invalid_roles' AS check_name,
+    COUNT(*)::text AS result
+  FROM public.profiles
+  WHERE role NOT IN ('user', 'nutritionist', 'partneradmin', 'admin')
+),
+partner_role_check AS (
+  SELECT
+    'partners_with_non_partneradmin_owner' AS check_name,
+    COUNT(*)::text AS result
+  FROM public.partners p
+  JOIN public.profiles pr
+    ON pr.id = p.owner_id
+  WHERE pr.role <> 'partneradmin'
+),
+orphan_partner_check AS (
+  SELECT
+    'partners_with_missing_owner_profile' AS check_name,
+    COUNT(*)::text AS result
+  FROM public.partners p
+  LEFT JOIN public.profiles pr
+    ON pr.id = p.owner_id
+  WHERE p.owner_id IS NOT NULL
+    AND pr.id IS NULL
+),
+counts_check AS (
+  SELECT 'profiles_count' AS check_name, COUNT(*)::text AS result FROM public.profiles
+  UNION ALL
+  SELECT 'partners_count', COUNT(*)::text FROM public.partners
+  UNION ALL
+  SELECT 'products_count', COUNT(*)::text FROM public.products
+  UNION ALL
+  SELECT 'recipes_count', COUNT(*)::text FROM public.recipes
+  UNION ALL
+  SELECT 'articles_count', COUNT(*)::text FROM public.articles
+  UNION ALL
+  SELECT 'quizzes_count', COUNT(*)::text FROM public.quizzes
+  UNION ALL
+  SELECT 'partnerinventory_count', COUNT(*)::text FROM public.partnerinventory
+  UNION ALL
+  SELECT 'partnerproductviews_count', COUNT(*)::text FROM public.partnerproductviews
+),
+rls_check AS (
+  SELECT
+    tablename AS check_name,
+    CASE WHEN rowsecurity THEN 'RLS_ON' ELSE 'RLS_OFF' END AS result
+  FROM pg_tables
+  WHERE schemaname = 'public'
+    AND tablename IN (
+      'profiles',
+      'userhealthprofiles',
+      'partners',
+      'partnerinventory',
+      'products',
+      'productcategories',
+      'recipes',
+      'recipeingredients',
+      'recipesteps',
+      'articles',
+      'usersavedproducts',
+      'usersavedrecipes',
+      'userreadarticles',
+      'shoppinglists',
+      'shoppinglistitems',
+      'patientalerts'
+    )
+)
+SELECT
+  'TABLE' AS section,
+  table_name AS item,
+  status AS result
+FROM table_check
+
+UNION ALL
+
+SELECT
+  'DATA' AS section,
+  check_name AS item,
+  result
+FROM role_check
+
+UNION ALL
+
+SELECT
+  'DATA' AS section,
+  check_name AS item,
+  result
+FROM partner_role_check
+
+UNION ALL
+
+SELECT
+  'DATA' AS section,
+  check_name AS item,
+  result
+FROM orphan_partner_check
+
+UNION ALL
+
+SELECT
+  'COUNT' AS section,
+  check_name AS item,
+  result
+FROM counts_check
+
+UNION ALL
+
+SELECT
+  'RLS' AS section,
+  check_name AS item,
+  result
+FROM rls_check
+
+ORDER BY section, item;
+
+-- Vérification des comptes partenaire
+SELECT
+  id,
+  email,
+  role
+FROM public.profiles
+WHERE role ILIKE '%partner%';
+
+
+SELECT
+  p.id AS partner_id,
+  p.name AS partner_name,
+  p.owner_id,
+  pr.email,
+  pr.role
+FROM public.partners p
+LEFT JOIN public.profiles pr
+  ON pr.id = p.owner_id
+ORDER BY p.name;
